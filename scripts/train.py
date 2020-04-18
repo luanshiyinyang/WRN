@@ -1,150 +1,134 @@
 """
 Author: Zhou Chen
 Date: 2020/4/16
-Desc: desc
+Desc: 训练resnet50-2
 """
-import os
 import pickle
+
 import torch
 import torch.nn as nn
-import torch.nn.parallel
+import torch.optim as optim
 import torch.backends.cudnn as cudnn
-import torch.optim
-import torch.utils.data
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-from wrn import WideResNet
-cudnn.benchmark = True
-os.environ["CUDA_VISIBLE_DEVICES"] = '3'
-batch_size = 32
-layers = 28
+from torchvision import transforms, datasets
+from torch.utils import data
+
+from model import WRN50_2
+
+# GPU配置
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    cudnn.benchmark = True
+device = "cuda:{}".format(0) if torch.cuda.is_available() else "cpu"
+
+
+batch_size = 128
+img_size = 224
 epochs = 100
 
-torch.cuda.empty_cache()
+
+def accuracy(output, label):
+    pred = torch.argmax(output, dim=-1)
+    correct = float(torch.sum(pred.eq(label)))
+    return correct / output.size(0)
 
 
-def train(train_loader, model, criterion, optimizer, scheduler, epoch):
-
+def train(train_loader, model, criterion, optimizer):
     model.train()
-    for step, (input, target) in enumerate(train_loader):
-        target = target.cuda()
-        input = input.cuda()
-        output = model(input)
+    losses = 0.0
+    step = 0
+    for step, (data, label) in enumerate(train_loader):
+        label = label.to(device)
+        data = data.to(device)
+        output = model(data)
 
-        loss = criterion(output, target)
-        acc = accuracy(output.data, target)
+        loss = criterion(output, label)
+        acc = accuracy(output.data, label)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        scheduler.step()
 
         if step % 50 == 0:
-            print("training step: {}, loss: {}, acc: {}".format(step, loss.item() / input.size(0), acc.item()))
+            print("training step: {}, loss: {}, acc: {}".format(step, loss.item() / data.size(0), acc))
+        losses += loss.item() / data.size(0)
 
-    return loss.item() / input.size(0)
+    return losses / (step + 1)
 
 
-def validate(val_loader, model, criterion, epoch):
+def validate(valid_loader, model, criterion):
     model.eval()
-
-    for step, (input, target) in enumerate(val_loader):
-        target = target.cuda()
-        input = input.cuda()
+    losses = 0.0
+    epoch_accuracy = 0.0
+    step = 0
+    for step, (data, label) in enumerate(valid_loader):
+        label = label.to(device)
+        data = data.to(device)
 
         with torch.no_grad():
-            output = model(input)
-        loss = criterion(output, target)
-        acc = accuracy(output.data, target)
-    if step % 50 == 0:
-        print("training step: {}, loss: {}, acc: {}".format(step, loss.data.item() / input.size(0), acc.item()))
-    return acc.item(), loss.data.item() / input.size(0)
+            output = model(data)
+        loss = criterion(output, label)
+        epoch_accuracy = accuracy(output.data, label)
+        if step % 50 == 0:
+            print("validation step: {}, loss: {}, acc: {}".format(step, loss.data.item() / data.size(0), epoch_accuracy))
+        losses += loss.item() / data.size(0)
+    return epoch_accuracy, losses / (step + 1)
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth'):
-    # 保存最好的模型
-    if is_best:
-        torch.save(state, filename)
-
-
-def accuracy(output, target):
-    batch_size = target.size(0)
-    _, pred = output.topk(1, 1, True, True)
-    pred = pred.t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-    res = []
-    correct_k = correct[:1].view(-1).float().sum(0)
-    res.append(correct_k.mul_(100.0 / batch_size))
-
-    return res[0] / batch_size
-
-
-def main(augment=False):
+def main(augment=True):
     # 数据准备
-    normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    # 是否增广
-    if augment:
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(32),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])
-    else:
-        transform_train = transforms.Compose([
-            transforms.Resize((32, 32)),
-            transforms.ToTensor(),
-            normalize,
-        ])
-    transform_valid = transforms.Compose([
-        transforms.Resize((32, 32)),
+    # 是否增广，采用原论文的增广方法
+    transform_train = transforms.Compose([
+        transforms.Resize(240),
+        transforms.RandomCrop(224, padding=4, padding_mode='reflect'),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        normalize
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    transform_valid = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    train_loader = torch.utils.data.DataLoader(
+    train_loader = data.DataLoader(
         datasets.ImageFolder('../data/Caltech101/train/', transform=transform_train),
         batch_size=batch_size,
         shuffle=True)
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder('../data/Caltech101/valid', transform=transform_valid),
+    valid_loader = data.DataLoader(
+        datasets.ImageFolder('../data/Caltech101/valid/', transform=transform_valid),
         batch_size=batch_size,
-        shuffle=False)
-
+        shuffle=True)
+    print(train_loader.dataset.classes)
     print("the number of train images: {}".format(len(train_loader.dataset)))
-    print("the number of valid images: {}".format(len(val_loader.dataset)))
+    print("the number of valid images: {}".format(len(valid_loader.dataset)))
 
     # 构建模型
-    model = WideResNet(layers, k=10, dropout_prob=0.5)
+    model = WRN50_2()
+    model.to(device)
 
     print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
     # 转移到GPU
-    model = model.cuda()
-    criterion = nn.CrossEntropyLoss().cuda()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, nesterov=True, weight_decay=5e-4)
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, len(train_loader) * epochs)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9, nesterov=True, weight_decay=5e-4)
 
     his = {
         'train_loss': [],
         'valid_loss': []
     }
+
     best_acc = 0.0
     for epoch in range(epochs):
-        train_loss = train(train_loader, model, criterion, optimizer, scheduler, epoch)
-        acc, valid_loss = validate(val_loader, model, criterion, epoch)
+        train_loss = train(train_loader, model, criterion, optimizer)
+        acc, valid_loss = validate(valid_loader, model, criterion)
         his['train_loss'].append(train_loss)
         his['valid_loss'].append(valid_loss)
 
         is_best = acc > best_acc
-        best_acc = max(acc, best_acc)
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'state_dict': model.state_dict(),
-            'epoch_acc': acc,
-        }, is_best)
-    print('best accuracy: ', best_acc)
+        if is_best:
+            # 本地保存更好的模型参数
+            best_acc = acc
+            torch.save({'state_dict': model.state_dict(), }, 'weights.pth')
+
     with open('his.pkl', 'wb') as f:
         pickle.dump(his, f)
 

@@ -34,109 +34,200 @@
 
 ![](./assets/block.png)
 
-事实上，令k=1就会发现就是基础的ResNet论文中所用的结构，通道分别为16、32和64，堆叠$6*N+2$的深度。本文作者加了个系数k从而通过增加输出的通道数来控制较小的N从而实现更宽（wide）的网络。调整l和k保证网络的复杂性基本不变进行了各种结构的尝试。由于网络加宽使得参数量增加，需要更有效的正则化方法，BN虽然有效但是需要配合充分的数据增强，需要尽量避免使用，通过在每个残差块的卷积层之间增加dropout并在Relu后对下一个残差块中的BN进行扰动以防过拟合。在非常深的残差网络中，上述方法有助于解决特征重用问题。
+事实上，令k=1就会发现就是基础的ResNet论文中所用的结构，通道分别为16、32和64，堆叠$6*N+2$的深度。**本文作者加了个系数k从而通过增加输出的通道数来控制较小的N从而实现更宽（wide）的网络。** 调整l和k保证网络的复杂性基本不变进行了各种结构的尝试。由于网络加宽使得参数量增加，需要更有效的正则化方法，BN虽然有效但是需要配合充分的数据增强，需要尽量避免使用，通过在每个残差块的卷积层之间增加dropout并在Relu后对下一个残差块中的BN进行扰动以防过拟合。在非常深的残差网络中，上述方法有助于解决特征重用问题。
 
 在选择合适的残差块设计后（事实上效果差别不大），与其他网络在Cifar数据集上进行对比实验，结果如下图。WRN40-4与ResNet1001相比，参数量类似，结果类似，训练速度却快了很多。这表明，增加宽度对模型的性能是有提升的，但不能武断认为哪种更好，需要寻优配合才行，不过，同等参数，宽度网络比深度网络容易训练。
 
 ![](./assets/cifar.png)
 
-由于实验进行较多，这里不具体列举更多数据集上的实验结果了。
+由于实验进行较多，这里不具体列举更多数据集上的实验结果了。最后，经过参数的不断尝试，获得在各个数据集上最好的结果的模型结构如下表。
+
+![](./assets/best.png)
 
 ## 项目实战
-我用Pytorch简单实现了WRN的网络结构（WRN28）并在Caltech101上进行了训练（原论文作者也在Github开源了代码，感兴趣可以直接访问，我的代码有参考原论文项目中Cifar数据集部分），具体的模型代码如下。
+我用Pytorch简单实现了WRN的网络结构（WRN50-2）并在Caltech101上进行了训练（原论文作者也在Github开源了代码，感兴趣可以直接访问），具体的模型代码如下。由于针对的是Caltech101数据集所以使用作者论文中对ImageNet的处理思路，基于Bottleneck结构的ResNet进行修改得到widen模型。
+
+同时，训练过程的数据增强也采用论文里的思路：随机翻转、随机裁减以及标准化。
+
+下面是使用PyTorch构建模型的源码，完整的训练代码可以在文末Github访问到。
 ```python
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.init as init
 
 
-class BasicBlock(nn.Module):
-    def __init__(self, in_planes, out_planes, stride, dropout_prob=0.0):
-        super(BasicBlock, self).__init__()
-        self.bn1 = nn.BatchNorm2d(in_planes)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.conv1 = nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_planes)
-        self.relu2 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_planes, out_planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.dropout_prob = dropout_prob
-        self.in_is_out = (in_planes == out_planes)
-        # 是否需要shortcut
-        self.shortcut = (not self.in_is_out) and nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride,
-                                                           padding=0, bias=False) or None
+class Conv(nn.Module):
+    """
+    重载带relu的卷积层
+    """
 
-    def forward(self, x):
-        if not self.in_is_out:
-            x = self.relu1(self.bn1(x))
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, activation):
+        """
+
+        :param in_channels:
+        :param out_channels:
+        :param kernel_size:
+        :param stride:
+        :param padding:
+        :param activation: 是否带激活层
+        """
+        super(Conv, self).__init__()
+        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
+                              stride=stride, padding=padding, bias=True)
+        self.bn = nn.BatchNorm2d(out_channels)
+        if activation:
+            self.f = nn.ReLU(inplace=True)
         else:
-            out = self.relu1(self.bn1(x))
-        out = self.relu2(self.bn2(self.conv1(out if self.in_is_out else x)))
-        if self.dropout_prob > 0:
-            out = F.dropout(out, p=self.dropout_prob, training=self.training)
-        out = self.conv2(out)
-        return torch.add(x if self.in_is_out else self.shortcut(x), out)
-
-
-class NetworkBlock(nn.Module):
-    def __init__(self, nb_layers, in_planes, out_planes, block, stride, dropout_prob=0.0):
-        super(NetworkBlock, self).__init__()
-        self.layer = self._make_layer(block, in_planes, out_planes, nb_layers, stride, dropout_prob)
-
-    def _make_layer(self, block, in_planes, out_planes, nb_layers, stride, dropRate):
-        layers = []
-        for i in range(int(nb_layers)):
-            layers.append(block(i == 0 and in_planes or out_planes, out_planes, i == 0 and stride or 1, dropRate))
-        return nn.Sequential(*layers)
+            self.f = None
 
     def forward(self, x):
-        return self.layer(x)
+        x = self.conv(x)
+        x = self.bn(x)
+        if self.f:
+            x = self.f(x)
+        return x
 
 
-class WideResNet(nn.Module):
-    def __init__(self, depth, num_classes=101, k=1, dropout_prob=0.0):
-        super(WideResNet, self).__init__()
-        n_channels = [16, 16 * k, 32 * k, 64 * k]
-        assert ((depth - 4) % 6 == 0)
-        n = (depth - 4) / 6
-        block = BasicBlock
-        self.conv1 = nn.Conv2d(3, n_channels[0], kernel_size=3, stride=1, padding=1, bias=False)
-        # block1
-        self.block1 = NetworkBlock(n, n_channels[0], n_channels[1], block, 1, dropout_prob)
-        # block2
-        self.block2 = NetworkBlock(n, n_channels[1], n_channels[2], block, 2, dropout_prob)
-        # block3
-        self.block3 = NetworkBlock(n, n_channels[2], n_channels[3], block, 2, dropout_prob)
+def wrn_conv1x1(in_channels, out_channels, stride, activate):
+    return Conv(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_size=1,
+        stride=stride,
+        padding=0,
+        activation=activate)
 
-        self.bn1 = nn.BatchNorm2d(n_channels[3])
-        self.relu = nn.ReLU(inplace=True)
-        self.fc = nn.Linear(n_channels[3], num_classes)
-        self.n_channels = n_channels[3]
 
-        # 参数初始化
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-            elif isinstance(m, nn.Linear):
-                m.bias.data.zero_()
+def wrn_conv3x3(in_channels, out_channels, stride, activate):
+    return Conv(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_size=3,
+        stride=stride,
+        padding=1,
+        activation=activate)
+
+
+class Bottleneck(nn.Module):
+    def __init__(self, in_channels, out_channels, stride, widen_factor):
+        super(Bottleneck, self).__init__()
+        mid_channels = int(round(out_channels // 4 * widen_factor))
+        self.conv1 = wrn_conv1x1(in_channels, mid_channels, stride=1, activate=True)
+        self.conv2 = wrn_conv3x3(mid_channels, mid_channels, stride=stride, activate=True)
+        self.conv3 = wrn_conv1x1(mid_channels, out_channels, stride=1, activate=False)
 
     def forward(self, x):
-        out = self.conv1(x)
-        out = self.block1(out)
-        out = self.block2(out)
-        out = self.block3(out)
-        out = self.relu(self.bn1(out))
-        out = F.avg_pool2d(out, 1)
-        out = out.view(-1, self.n_channels)
-        return self.fc(out)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        return x
+
+
+class Unit(nn.Module):
+    def __init__(self, in_channels, out_channels, stride, widen_factor):
+        super(Unit, self).__init__()
+        self.resize_identity = (in_channels != out_channels) or (stride != 1)
+        self.body = Bottleneck(in_channels, out_channels, stride, widen_factor)
+        if self.resize_identity:
+            self.identity_conv = wrn_conv1x1(in_channels, out_channels, stride, activate=False)
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        if self.resize_identity:
+            identity = self.identity_conv(x)
+        else:
+            identity = x
+        x = self.body(x)
+        x = x + identity
+        x = self.activation(x)
+        return x
+
+
+class InitBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(InitBlock, self).__init__()
+        self.conv = Conv(in_channels, out_channels, 7, 2, 3, True)
+        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.pool(x)
+        return x
+
+
+class WRN(nn.Module):
+
+    def __init__(self, channels, init_block_channels, widen_factor, in_channels=3, img_size=(224, 224), num_classes=101):
+        super(WRN, self).__init__()
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.features = nn.Sequential()
+        self.features.add_module("init_block", InitBlock(in_channels=in_channels, out_channels=init_block_channels))
+        in_channels = init_block_channels
+        # 结构嵌套
+        for i, channels_per_stage in enumerate(channels):
+            stage = nn.Sequential()
+            for j, out_channels in enumerate(channels_per_stage):
+                stride = 2 if (j == 0) and (i != 0) else 1
+                stage.add_module("unit{}".format(j + 1),
+                                 Unit(in_channels, out_channels, stride, widen_factor))
+                in_channels = out_channels
+            self.features.add_module("stage{}".format(i + 1), stage)
+        # 平均池化层
+        self.features.add_module('final_avg_pool', nn.AvgPool2d(kernel_size=7, stride=1))
+        # 输出分类层
+        self.output = nn.Linear(in_features=in_channels, out_features=num_classes)
+        self._init_params()
+
+    def _init_params(self):
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Conv2d):
+                init.kaiming_uniform_(module.weight)
+                if module.bias is not None:
+                    init.constant_(module.bias, 0)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.output(x)
+        return x
+
+
+def get_wrn(blocks, widen_factor, **kwargs):
+    if blocks == 50:
+        layers = [3, 4, 6, 3]
+    elif blocks == 101:
+        layers = [3, 4, 23, 3]
+    elif blocks == 152:
+        layers = [3, 8, 36, 3]
+    elif blocks == 200:
+        layers = [3, 24, 36, 3]
+    else:
+        raise ValueError("Error WRN block number: {}".format(blocks))
+
+    init_block_channels = 64
+    channels_per_layers = [256, 512, 1024, 2048]
+    channels = [[ci] * li for (ci, li) in zip(channels_per_layers, layers)]
+    model = WRN(channels, init_block_channels, widen_factor, **kwargs)
+
+    return model
+
+
+def WRN50_2():
+    return get_wrn(50, 2.0)
+
+
+if __name__ == '__main__':
+    model = WRN50_2()
+    print(model)
 ```
-简单可视化训练过程（loss图）。
+
+简单可视化训练过程（loss图）如下，训练速度确实比原始ResNet快很多（同等复杂性网络）。
+
+![](./assets/his.png)
 
 
 ## 补充说明
-本文其实相对是比较简单的论文，验证了宽度给模型性能带来的提升，为很多网络结构设计提供了新的思路，我在很多上层计算机视觉任务的特征提取网络中都看到了WRN的影子，是非常实用的残差网络思路。最后的实现代码可以在我的Github访问到，欢迎star或者fork。
+本文其实相对是比较简单的论文，验证了宽度给模型性能带来的提升，为很多网络结构设计提供了新的思路，我在很多上层计算机视觉任务的特征提取网络中都看到了WRN的影子，是非常实用的残差网络思路。篇幅限制，并没有太过深入分析原理，感兴趣可以查看原论文，并不复杂。最后的实现代码可以在[我的Github](https://github.com/luanshiyinyang/WRN)访问到，欢迎star或者fork。
 
 ## 参考论文
 
